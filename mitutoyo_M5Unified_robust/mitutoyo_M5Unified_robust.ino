@@ -470,18 +470,48 @@ bool repairTrailingCsvCorruption() {
   return rollbackFileToSize(lastValidEnd);
 }
 
-bool loadCsvState() {
+void resetSessionState() {
   nextNo = 1;
   recordCount = 0;
   sumValue = 0.0;
   averageValue = 0.0;
+}
+
+bool addRecordToLatestSession(uint32_t parsedNo, double parsedValue,
+                              bool& sessionActive, uint32_t& lastSessionNo) {
+  if (parsedNo == 1) {
+    recordCount = 1;
+    sumValue = parsedValue;
+    sessionActive = true;
+    lastSessionNo = 1;
+    return isfinite(sumValue);
+  }
+
+  if (!sessionActive || parsedNo != lastSessionNo + 1) {
+    // A later valid No.1 is required to identify the start of a session.
+    resetSessionState();
+    sessionActive = false;
+    lastSessionNo = 0;
+    return true;
+  }
+
+  if (recordCount == UINT32_MAX) return false;
+  ++recordCount;
+  sumValue += parsedValue;
+  lastSessionNo = parsedNo;
+  return isfinite(sumValue);
+}
+
+bool loadLatestSessionState() {
+  resetSessionState();
 
   if (!SD.exists(DATA_FILE)) return true;
 
   File file = SD.open(DATA_FILE, FILE_READ);
   if (!file) return false;
 
-  uint32_t lastValidNo = 0;
+  uint32_t lastSessionNo = 0;
+  bool sessionActive = false;
   char line[CSV_LINE_BUFFER_SIZE];
   size_t lineLength = 0;
   bool overflow = false;
@@ -495,13 +525,11 @@ bool loadCsvState() {
       uint32_t parsedNo = 0;
       double parsedValue = 0.0;
       if (!overflow && parseCsvRecord(line, parsedNo, parsedValue)) {
-        lastValidNo = parsedNo;
-        sumValue += parsedValue;
-        if (recordCount == UINT32_MAX) {
+        if (!addRecordToLatestSession(parsedNo, parsedValue,
+                                      sessionActive, lastSessionNo)) {
           file.close();
           return false;
         }
-        ++recordCount;
       }
       lineLength = 0;
       overflow = false;
@@ -521,19 +549,21 @@ bool loadCsvState() {
     uint32_t parsedNo = 0;
     double parsedValue = 0.0;
     if (!overflow && parseCsvRecord(line, parsedNo, parsedValue)) {
-      lastValidNo = parsedNo;
-      sumValue += parsedValue;
-      if (recordCount == UINT32_MAX) {
+      if (!addRecordToLatestSession(parsedNo, parsedValue,
+                                    sessionActive, lastSessionNo)) {
         file.close();
         return false;
       }
-      ++recordCount;
     }
   }
   file.close();
 
-  if (lastValidNo == UINT32_MAX) return false;
-  nextNo = lastValidNo == 0 ? 1 : lastValidNo + 1;
+  if (!sessionActive) {
+    resetSessionState();
+    return true;
+  }
+  if (lastSessionNo == UINT32_MAX) return false;
+  nextNo = lastSessionNo + 1;
   averageValue = recordCount == 0 ? 0.0 : sumValue / static_cast<double>(recordCount);
   return isfinite(sumValue) && isfinite(averageValue);
 }
@@ -575,7 +605,9 @@ bool appendCurrentRecordVerified(double measuredValue) {
 
   // Clear a rare stale journal before creating the next transaction.
   if (SD.exists(JOURNAL_FILE)) {
-    if (!recoverInterruptedAppend() || !repairTrailingCsvCorruption() || !loadCsvState()) {
+    if (!recoverInterruptedAppend() ||
+        !repairTrailingCsvCorruption() ||
+        !loadLatestSessionState()) {
       return false;
     }
   }
@@ -661,16 +693,63 @@ bool findLastNonEmptyLineStart(uint32_t& lineStartOut) {
   return found;
 }
 
+bool readCsvRecordAt(uint32_t lineStart, uint32_t& noOut, double& valueOut) {
+  File file = SD.open(DATA_FILE, FILE_READ);
+  if (!file) return false;
+  if (!file.seek(lineStart)) {
+    file.close();
+    return false;
+  }
+
+  char line[CSV_LINE_BUFFER_SIZE];
+  size_t lineLength = 0;
+  bool overflow = false;
+  while (file.available()) {
+    const int input = file.read();
+    if (input < 0 || input == '\n') break;
+    if (input == 0 || lineLength + 1 >= sizeof(line)) {
+      overflow = true;
+      continue;
+    }
+    if (!overflow) line[lineLength++] = static_cast<char>(input);
+  }
+  file.close();
+
+  if (overflow) return false;
+  line[lineLength] = '\0';
+  return parseCsvRecord(line, noOut, valueOut);
+}
+
 bool deleteLastRecord() {
+  const bool hadJournal = SD.exists(JOURNAL_FILE);
   if (!recoverInterruptedAppend() || !repairTrailingCsvCorruption()) return false;
+  if (hadJournal && !loadLatestSessionState()) return false;
+
+  // Do not delete records belonging to a previous power-on session.
+  if (recordCount == 0 || nextNo <= 1) return false;
   if (!SD.exists(DATA_FILE)) return false;
 
   uint32_t lastLineStart = 0;
   if (!findLastNonEmptyLineStart(lastLineStart)) return false;
+
+  uint32_t deletedNo = 0;
+  double deletedValue = 0.0;
+  if (!readCsvRecordAt(lastLineStart, deletedNo, deletedValue)) return false;
+  if (deletedNo != nextNo - 1) return false;
+
   if (!copyPrefixToTemp(lastLineStart)) return false;
   if (!replaceDataFileWithTemp()) return false;
 
-  return repairTrailingCsvCorruption() && loadCsvState();
+  --nextNo;
+  --recordCount;
+  sumValue -= deletedValue;
+  if (recordCount == 0) {
+    sumValue = 0.0;
+    averageValue = 0.0;
+  } else {
+    averageValue = sumValue / static_cast<double>(recordCount);
+  }
+  return isfinite(sumValue) && isfinite(averageValue);
 }
 
 // -----------------------------------------------------------------------------
@@ -879,10 +958,16 @@ bool handleDeleteButton() {
 }
 
 bool initializeStorageState() {
-  return recoverInterruptedFileReplacement() &&
-         recoverInterruptedAppend() &&
-         repairTrailingCsvCorruption() &&
-         loadCsvState();
+  if (!recoverInterruptedFileReplacement() ||
+      !recoverInterruptedAppend() ||
+      !repairTrailingCsvCorruption()) {
+    return false;
+  }
+
+  // Every power-on or reset starts a new measurement session. Existing CSV
+  // records remain on the SD card, but numbering and the average restart here.
+  resetSessionState();
+  return true;
 }
 
 void setup() {
